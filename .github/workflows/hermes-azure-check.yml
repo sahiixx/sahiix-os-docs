@@ -1,12 +1,46 @@
 name: hermes-azure-check
 
 on:
-  workflow_dispatch:
   push:
     branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      run_live:
+        description: Run the live Azure Foundry verification
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
-  verify:
+  offline:
+    name: Offline documentation checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate documentation contract
+        run: |
+          set -euo pipefail
+          for file in AGENTS.md README.md INTEGRATION_CONTRACT.md MASTER_INDEX.md; do
+            test -s "$file"
+          done
+          python - <<'PY'
+          from pathlib import Path
+
+          agents = Path("AGENTS.md").read_text()
+          required_sections = ("## Models", "## Hermes usage", "AZURE_FOUNDRY_API_KEY")
+          missing = [section for section in required_sections if section not in agents]
+          if missing:
+              raise SystemExit(f"AGENTS.md is missing required sections: {missing}")
+          PY
+
+  live:
+    name: Live Azure Foundry verification
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_live == true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,14 +50,34 @@ jobs:
           AZURE_FOUNDRY_API_KEY: ${{ secrets.AZURE_FOUNDRY_API_KEY }}
           AZURE_FOUNDRY_BASE_URL: ${{ secrets.AZURE_FOUNDRY_BASE_URL }}
         run: |
-          if [ -z "$AZURE_FOUNDRY_API_KEY" ]; then
-            echo "AZURE_FOUNDRY_API_KEY not set - skipping live check"
-            exit 0
+          set -euo pipefail
+          if [[ -z "${AZURE_FOUNDRY_API_KEY//[[:space:]]/}" ]]; then
+            echo "::error::AZURE_FOUNDRY_API_KEY is required when run_live is true"
+            exit 1
           fi
-          code=$(curl -sS -o /tmp/out.json -w '%{http_code}' \
-            -H "api-key: $AZURE_FOUNDRY_API_KEY" \
-            -H 'Content-Type: application/json' \
-            "$AZURE_FOUNDRY_BASE_URL/chat/completions" \
-            -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"ping"}],"max_completion_tokens":16}')
-          echo "HTTP $code"
-          test "$code" = "200"
+          base_url="${AZURE_FOUNDRY_BASE_URL%/}"
+          if [[ ! "$base_url" =~ ^https://[^/[:space:]]+(/[^[:space:]]*)?$ ]]; then
+            echo "::error::AZURE_FOUNDRY_BASE_URL must be an HTTPS URL"
+            exit 1
+          fi
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          if ! http_code="$(curl --silent --show-error \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --header "api-key: $AZURE_FOUNDRY_API_KEY" \
+            --header 'Content-Type: application/json' \
+            --data '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"ping"}],"max_completion_tokens":16}' \
+            "$base_url/chat/completions")"; then
+            echo "::error::Azure Foundry request failed before receiving an HTTP response"
+            exit 1
+          fi
+
+          if [[ "$http_code" != "200" ]]; then
+            echo "::error::Azure Foundry returned HTTP $http_code; verify the endpoint and credentials"
+            exit 1
+          fi
+          echo "Azure Foundry verification succeeded (HTTP 200)"
